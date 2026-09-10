@@ -145,6 +145,23 @@ void test_malformed_nam_file_throws_validation_error()
   }
 }
 
+void test_get_dsp_result_reports_file_errors()
+{
+  const TemporaryNamFile file("nam_core_result_malformed_test.nam", R"({"version":)");
+  const auto result = nam::get_dsp_result(file.path);
+  assert(!result);
+  assert(result.dsp == nullptr);
+  assert(!result.error.empty());
+}
+
+void test_get_dsp_result_reports_config_errors()
+{
+  const auto result = nam::get_dsp_result(nlohmann::json::object());
+  assert(!result);
+  assert(result.dsp == nullptr);
+  assert(!result.error.empty());
+}
+
 void test_gets_input_level()
 {
   nam::dspData config = _GetConfig();

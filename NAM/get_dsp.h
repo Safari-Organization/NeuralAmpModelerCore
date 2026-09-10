@@ -77,6 +77,15 @@ struct DspLoadOptions
   std::optional<bool> prewarm = std::nullopt;
 };
 
+/// \brief Result returned by the non-throwing DSP loading API
+struct DspLoadResult
+{
+  std::unique_ptr<DSP> dsp;
+  std::string error;
+
+  explicit operator bool() const noexcept { return dsp != nullptr; }
+};
+
 /// \brief Get NAM from a .nam file at the provided location
 /// \param config_filename Path to the .nam model file
 /// \param options Loading options
@@ -114,6 +123,18 @@ std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConf
 /// \param options Loading options
 /// \return Unique pointer to a DSP object
 std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, DspLoadOptions options = DspLoadOptions());
+
+/// \brief Load a .nam file without allowing loader exceptions to cross the API boundary
+DspLoadResult get_dsp_result(const std::filesystem::path config_filename,
+                             DspLoadOptions options = DspLoadOptions()) noexcept;
+
+/// \brief Load a parsed .nam configuration without allowing loader exceptions to cross the API boundary
+DspLoadResult get_dsp_result(const nlohmann::json& config,
+                             DspLoadOptions options = DspLoadOptions()) noexcept;
+
+/// \brief Reset and prewarm a DSP without allowing exceptions to cross the API boundary
+/// \return Empty on success, otherwise a human-readable error
+std::string reset_dsp_result(DSP& dsp, double sample_rate, int max_buffer_size) noexcept;
 
 /// \brief Get sample rate from a .nam file
 /// \param j JSON object from the .nam file
