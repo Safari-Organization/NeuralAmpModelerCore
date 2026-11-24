@@ -37,6 +37,11 @@ namespace a2_fast
 namespace
 {
 
+// Frames per register tile in the Channels >= 8 layer kernel. 4 keeps an 8x4
+// accumulator plus an 8x8 weight tap in NEON/AVX registers; 8 spills and was
+// measured slower (Apple M4).
+constexpr int kA2FrameTile = 4;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -631,10 +636,6 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   }
   else
   {
-    // Use Eigen's tuned 8x8 × 8xN GEMM for the whole block at once. Unlike a
-    // small-tile version, this hits Eigen's actual GEMM kernel (tuned for
-    // inner dimensions of ~64) rather than its tiny-matrix fallback path.
-    //
     // Compile-time improvements over the generic WaveNet path:
     //   - Channels and Bottleneck are template constants (no dynamic shape).
     //   - Per-layer buffers are pre-sized at SetMaxBufferSize; nothing resizes
@@ -653,29 +654,63 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const VecC> mixin_vec(L.mixin_w.data());
     Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w.data());
     Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b.data());
-    Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
 
-    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
+    using MatCT = Eigen::Matrix<float, Channels, kA2FrameTile>;
 
-    ztile.setZero();
+    // Dilated conv, frame-tiled: for each tile of kA2FrameTile frames, a
+    // Channels x tile accumulator stays in registers across all K taps. The
+    // products are fixed-size (fully unrolled), so there is no per-call GEMM
+    // packing. That packing dominated at small host blocks (Eigen's GEMM path
+    // was ~2x slower per frame at 16 frames than at 512), and the tile also
+    // beats the whole-block GEMM at large blocks (Apple M4: -54 % at 16
+    // frames, -24 % at 512). Fusing the post-conv ops into the tile measured
+    // slower, so they stay block ops below. The per-element sequence is
+    // unchanged (taps in order, then bias, mixin, LeakyReLU, head sum, 1x1);
+    // only the summation order inside each 8-term dot product may differ.
+    const int tiled_frames = num_frames - num_frames % kA2FrameTile;
 
-    // Conv: one 8x8 × 8xN GEMM per tap.
-    for (int k = 0; k < K; k++)
+    for (int f0 = 0; f0 < tiled_frames; f0 += kA2FrameTile)
     {
-      const int tap_base = tap_base_phys(K - 1 - k);
-      Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
-      Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
-      ztile.noalias() += W * input_block;
+      MatCT acc = MatCT::Zero();
+      for (int k = 0; k < K; k++)
+      {
+        const int tap_base = tap_base_phys(K - 1 - k);
+        Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
+        Eigen::Map<const MatCT> x(&L.history[static_cast<size_t>(tap_base + f0) * Channels]);
+        acc.noalias() += W.lazyProduct(x);
+      }
+
+      Eigen::Map<MatCT> z_tile(&_z[static_cast<size_t>(f0) * Channels]);
+      z_tile = acc;
     }
 
-    // Post-conv: bias, mixin, LeakyReLU, head_sum, 1x1 residual — all block ops.
-    ztile.colwise() += conv_b_vec;
-    ztile.noalias() += mixin_vec * cond_row; // rank-1 outer product
-    ztile = (ztile.array() < 0.0f).select(ztile.array() * kLeakySlope, ztile.array());
-    hsum_block += ztile;
-    lin_block.noalias() += l1x1_mat * ztile; // 8x8 × 8xN GEMM
+    // Remaining frames (fewer than one tile).
+    if (tiled_frames < num_frames)
+    {
+      const int rest = num_frames - tiled_frames;
+      Eigen::Map<MatCDyn> z_tail(&_z[static_cast<size_t>(tiled_frames) * Channels], Channels, rest);
+      z_tail.setZero();
+      for (int k = 0; k < K; k++)
+      {
+        const int tap_base = tap_base_phys(K - 1 - k);
+        Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
+        Eigen::Map<const MatCDyn> x(&L.history[static_cast<size_t>(tap_base + tiled_frames) * Channels], Channels,
+                                    rest);
+        z_tail.noalias() += W.lazyProduct(x);
+      }
+    }
+
+    // Post-conv: bias, mixin, LeakyReLU, head_sum — block ops.
+    Eigen::Map<MatCDyn> z_block(_z.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
+    Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
+
+    z_block.colwise() += conv_b_vec;
+    z_block.noalias() += mixin_vec * cond_row; // rank-1 outer product
+    z_block = (z_block.array() < 0.0f).select(z_block.array() * kLeakySlope, z_block.array());
+    hsum_block += z_block;
+    lin_block.noalias() += l1x1_mat.lazyProduct(z_block); // 8x8 × 8xN, no GEMM packing
     lin_block.colwise() += l1x1_b_vec;
   }
 }
