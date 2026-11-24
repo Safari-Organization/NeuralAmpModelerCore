@@ -165,6 +165,74 @@ std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, DspLoadOptions option
   return get_dsp(config, temp, options);
 }
 
+DspLoadResult get_dsp_result(const std::filesystem::path config_filename, DspLoadOptions options) noexcept
+{
+  DspLoadResult result;
+
+  try
+  {
+    result.dsp = get_dsp(std::move(config_filename), options);
+  }
+  catch (const std::exception& error)
+  {
+    result.error = error.what();
+  }
+  catch (...)
+  {
+    result.error = "Unknown error while loading NAM model.";
+  }
+
+  return result;
+}
+
+DspLoadResult get_dsp_result(const nlohmann::json& config, DspLoadOptions options) noexcept
+{
+  DspLoadResult result;
+
+  if (!config.is_object() || !config.contains("version") || !config["version"].is_string()
+      || !config.contains("architecture") || !config["architecture"].is_string()
+      || !config.contains("config") || !config["config"].is_object()
+      || !config.contains("weights") || !config["weights"].is_array()
+      || (config.contains("sample_rate") && !config["sample_rate"].is_number())
+      || (config.contains("metadata") && !config["metadata"].is_object() && !config["metadata"].is_null()))
+  {
+    result.error = "NAM configuration is missing required fields or contains invalid field types.";
+    return result;
+  }
+
+  try
+  {
+    result.dsp = get_dsp(config, options);
+  }
+  catch (const std::exception& error)
+  {
+    result.error = error.what();
+  }
+  catch (...)
+  {
+    result.error = "Unknown error while loading NAM model.";
+  }
+
+  return result;
+}
+
+std::string reset_dsp_result(DSP& dsp, const double sample_rate, const int max_buffer_size) noexcept
+{
+  try
+  {
+    dsp.ResetAndPrewarm(sample_rate, max_buffer_size);
+    return {};
+  }
+  catch (const std::exception& error)
+  {
+    return error.what();
+  }
+  catch (...)
+  {
+    return "Unknown error while resetting NAM model.";
+  }
+}
+
 std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, dspData& returnedConfig,
                              DspLoadOptions options)
 {

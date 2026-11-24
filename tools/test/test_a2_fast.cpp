@@ -286,10 +286,12 @@ void test_matches_generic(int channels)
   std::vector<float> w_gen = weights;
   auto generic_dsp = generic_cfg.create(std::move(w_gen), 48000.0);
 
-  // Exercise with two block sizes to catch any off-by-one in the ring-buffer rewind.
+  // Exercise several block sizes to catch any off-by-one in the ring-buffer rewind.
+  // 1, 7 and 17 are not multiples of the Channels >= 8 frame tile (4), so they
+  // cover the tile remainder path (1 is remainder-only).
   const int total = 2048;
   const auto input = make_test_input(total, 48000.0);
-  for (int block : {64, 256})
+  for (int block : {1, 7, 17, 64, 256})
   {
     const auto out_generic = run_dsp(*generic_dsp, input, block);
     const auto out_fast = run_dsp(*fast_dsp, input, block);
